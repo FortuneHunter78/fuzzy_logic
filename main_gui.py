@@ -24,6 +24,7 @@ class FuzzyAppGUI:
         self.cluster_colors_rgb = []
         self.last_cluster_mode = None
         self._slider_job = None
+        self._slider_job_alpha2 = None
 
         self._build_ui()
         self.log_msg("[SYSTEM] Программа запущена. Готова к генерации нечётких величин.")
@@ -97,6 +98,19 @@ class FuzzyAppGUI:
 
         ttk.Button(alpha_frame, text="Применить α", command=self.on_alpha_entry_apply).grid(row=0, column=3, padx=4)
 
+        alpha2_frame = ttk.LabelFrame(top_container, text="Уровень отсечения внутри нечеткого множества α₂", padding=8)
+        alpha2_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
+        ttk.Label(alpha2_frame, text="B ≥").grid(row=0, column=0, padx=3)
+        self.ent_alpha2 = ttk.Entry(alpha2_frame, width=6)
+        self.ent_alpha2.insert(0, "0.00")
+        self.ent_alpha2.grid(row=0, column=1, padx=3)
+        self.ent_alpha2.bind("<Return>", lambda event: self.on_alpha2_entry_apply())
+        self.scale_alpha2 = tk.Scale(alpha2_frame, from_=0.0, to=10.0, resolution=0.01,
+            orient=tk.HORIZONTAL, showvalue=False, length=170, command=self.on_alpha2_slider_move)
+        self.scale_alpha2.set(0.0)
+        self.scale_alpha2.grid(row=0, column=2, padx=5)
+        ttk.Button(alpha2_frame, text="Применить", command=self.on_alpha2_entry_apply).grid(row=0, column=3, padx=3)
+
         mid_frame = ttk.Frame(self.root)
         mid_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=4)
 
@@ -139,7 +153,7 @@ class FuzzyAppGUI:
         main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        plot_frame = ttk.LabelFrame(main_pane, text="Визуализация графиков Э(x; λ), линии отсечения α и кластеров")
+        plot_frame = ttk.LabelFrame(main_pane, text="Визуализация графиков Э(x; λ) и кластеров")
         main_pane.add(plot_frame, weight=3)
 
         self.fig, (self.ax_curves, self.ax_intervals) = plt.subplots(2, 1, figsize=(8, 6), dpi=100)
@@ -285,6 +299,52 @@ class FuzzyAppGUI:
                 tags=("noise_tag",)
             )
 
+    def _get_alpha2(self) -> float:
+        return float(self.ent_alpha2.get())
+
+    def _get_active_dataset(self, alpha: float = None):
+        if alpha is None:
+            alpha = float(self.ent_alpha.get())
+        alpha2 = self._get_alpha2()
+        return [fv for fv in self.dataset if fv.get_alpha_cut(alpha)[1] >= alpha2]
+
+    def _sync_alpha2_scale_range(self, alpha: float):
+        if not self.dataset:
+            return
+        max_b = max(fv.get_alpha_cut(alpha)[1] for fv in self.dataset)
+        try:
+            current_alpha2 = float(self.ent_alpha2.get())
+        except ValueError:
+            current_alpha2 = 0.0
+        upper = max(1.0, max_b * 1.05, current_alpha2)
+        self.scale_alpha2.configure(to=upper)
+
+    def on_alpha2_slider_move(self, val_str: str):
+        alpha2 = float(val_str)
+        self.ent_alpha2.delete(0, tk.END)
+        self.ent_alpha2.insert(0, f"{alpha2:.2f}")
+        if not self.dataset:
+            return
+        if self._slider_job_alpha2 is not None:
+            self.root.after_cancel(self._slider_job_alpha2)
+        self._slider_job_alpha2 = self.root.after(
+            40, lambda: self._recalculate_for_new_alpha(float(self.ent_alpha.get()), log_change=False))
+
+    def on_alpha2_entry_apply(self):
+        raw = self.ent_alpha2.get()
+        try:
+            alpha2 = float(raw)
+            if not math.isfinite(alpha2) or alpha2 < 0:
+                raise ValueError("Порог вертикального сечения α₂ должен быть конечным и неотрицательным.")
+            if self.dataset:
+                self._sync_alpha2_scale_range(float(self.ent_alpha.get()))
+            self.scale_alpha2.set(alpha2)
+            if self.dataset:
+                self._recalculate_for_new_alpha(float(self.ent_alpha.get()), log_change=True)
+        except Exception as e:
+            self.log_error("ALPHA_CUT_2", e, f"alpha2='{raw}'")
+            messagebox.showerror("Ошибка вертикального сечения", str(e))
+
     def on_alpha_slider_move(self, val_str: str):
         alpha = float(val_str)
         self.ent_alpha.delete(0, tk.END)
@@ -305,6 +365,7 @@ class FuzzyAppGUI:
                 raise ValueError("Уровень отсечения alpha должен находиться в интервале (0; 1].")
             self.scale_alpha.set(alpha)
             if self.dataset:
+                self._sync_alpha2_scale_range(alpha)
                 self._recalculate_for_new_alpha(alpha, log_change=True)
         except Exception as e:
             self.log_error("ALPHA_CUT", e, f"alpha='{raw_alpha}'")
@@ -313,14 +374,21 @@ class FuzzyAppGUI:
     def _recalculate_for_new_alpha(self, alpha: float, log_change: bool = True):
         if not self.dataset:
             return
+        self._sync_alpha2_scale_range(alpha)
 
         if self.last_cluster_mode == "kmeans":
-            k = int(self.ent_k.get())
+            requested_k = int(self.ent_k.get())
             min_sz = int(self.ent_min_size.get())
             seed = int(self.ent_seed.get())
-            self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_k_means(
-                self.dataset, k, alpha, min_cluster_size=min_sz, seed=seed
-            )
+            active_dataset = self._get_active_dataset(alpha)
+            if not active_dataset:
+                self.clusters, self.noise_items = {}, []
+            else:
+                # При движении α₂ выборка может стать меньше исходного K.
+                k = min(requested_k, len(active_dataset))
+                self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_k_means(
+                    active_dataset, k, alpha, min_cluster_size=min_sz, seed=seed
+                )
             rgb_colors, hex_colors = self.generate_contrasting_colors(len(self.clusters))
             self.cluster_colors_rgb = rgb_colors
             self.update_table(alpha, self._build_cluster_map())
@@ -328,9 +396,13 @@ class FuzzyAppGUI:
         elif self.last_cluster_mode == "criterion":
             thresh = float(self.ent_thresh.get())
             min_sz = int(self.ent_min_size.get())
-            self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_criterion(
-                self.dataset, thresh, alpha, min_cluster_size=min_sz
-            )
+            active_dataset = self._get_active_dataset(alpha)
+            if not active_dataset:
+                self.clusters, self.noise_items = {}, []
+            else:
+                self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_criterion(
+                    active_dataset, thresh, alpha, min_cluster_size=min_sz
+                )
             rgb_colors, hex_colors = self.generate_contrasting_colors(len(self.clusters))
             self.cluster_colors_rgb = rgb_colors
             self.update_table(alpha, self._build_cluster_map())
@@ -368,6 +440,7 @@ class FuzzyAppGUI:
                 )
 
             self.dataset = FuzzySetGenerator.generate_set(count, lmin, lmax, norm, seed=seed)
+            self._sync_alpha2_scale_range(alpha)
             self.clusters = {}
             self.noise_items = []
             self.last_cluster_mode = None
@@ -395,8 +468,10 @@ class FuzzyAppGUI:
             f"alpha='{self.ent_alpha.get()}', seed='{self.ent_seed.get()}'"
         )
         try:
-            k = int(self.ent_k.get())
+            requested_k = int(self.ent_k.get())
             min_sz = int(self.ent_min_size.get())
+            if requested_k < 1:
+                raise ValueError("Число кластеров K должно быть не меньше 1.")
             if min_sz < 1:
                 raise ValueError("Минимальный размер кластера для отсева должен быть >= 1.")
             alpha = float(self.ent_alpha.get())
@@ -404,8 +479,14 @@ class FuzzyAppGUI:
             max_iter = 100
             tol = 1e-6
 
+            active_dataset = self._get_active_dataset(alpha)
+            if not active_dataset:
+                raise ValueError("После применения α₂ выборка пуста.")
+            k = min(requested_k, len(active_dataset))
+            if k != requested_k:
+                self.log_warning("CLUSTERING", f"K уменьшено с {requested_k} до {k}: после α₂ осталось {len(active_dataset)} элементов.")
             self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_k_means(
-                self.dataset, k, alpha, min_cluster_size=min_sz, max_iter=max_iter, tol=tol, seed=seed
+                active_dataset, k, alpha, min_cluster_size=min_sz, max_iter=max_iter, tol=tol, seed=seed
             )
             self.last_cluster_mode = "kmeans"
             params_str = f"k={k}, min_size={min_sz}, max_iter={max_iter}, tol={tol:.0e}, seed={seed}"
@@ -431,9 +512,13 @@ class FuzzyAppGUI:
             alpha = float(self.ent_alpha.get())
             seed = int(self.ent_seed.get())
 
-            self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_criterion(
-                self.dataset, thresh, alpha, min_cluster_size=min_sz
-            )
+            active_dataset = self._get_active_dataset(alpha)
+            if not active_dataset:
+                self.clusters, self.noise_items = {}, []
+            else:
+                self.clusters, self.noise_items = FuzzyClusterAnalyzer.cluster_by_criterion(
+                    active_dataset, thresh, alpha, min_cluster_size=min_sz
+                )
             self.last_cluster_mode = "criterion"
             params_str = f"threshold={thresh}, min_size={min_sz}, alpha={alpha}, seed={seed}"
             self._apply_clustering_results(alpha, params_str=params_str)
@@ -447,6 +532,8 @@ class FuzzyAppGUI:
 
         self.update_table(alpha, self._build_cluster_map())
         self.update_legend_tab(alpha, hex_colors)
+        active_count = len(self._get_active_dataset(alpha))
+        self.log_msg(f"[ALPHA_CUT_2] Сечение B ≥ {self._get_alpha2():.3f}: оставлено {active_count}/{len(self.dataset)} величин.")
         self.notebook.select(1)
         self.draw_plots(alpha)
 
@@ -543,7 +630,6 @@ class FuzzyAppGUI:
     def draw_plots(self, alpha: float):
         self.ax_curves.clear()
         self.ax_intervals.clear()
-
         if not self.dataset:
             self.canvas.draw()
             return
@@ -551,64 +637,80 @@ class FuzzyAppGUI:
         min_lam = min(fv.lam for fv in self.dataset)
         fixed_x_max = max(3.0, 1.5 / min_lam)
         x_vals = np.linspace(0, fixed_x_max, 250)
+        alpha2 = self._get_alpha2()
+        active_names = {fv.name for fv in self._get_active_dataset(alpha)}
+        self.ax_curves.axhline(y=alpha, color="red", linestyle="--", linewidth=1.8,
+                               label=f"Уровень отсечения α₁ = {alpha:.2f}")
 
-        self.ax_curves.axhline(
-            y=alpha, color="red", linestyle="--", linewidth=1.8, label=f"Уровень отсечения α = {alpha:.2f}"
-        )
+        color_by_name = {}
+        for idx_c, (cid, items) in enumerate(self.clusters.items()):
+            color = self.cluster_colors_rgb[idx_c] if idx_c < len(self.cluster_colors_rgb) else (0.2, 0.4, 0.7)
+            for fv in items:
+                color_by_name[fv.name] = color
+        noise_names = {fv.name for fv in self.noise_items}
+        for fv in self.noise_items:
+            color_by_name[fv.name] = (0.6, 0.6, 0.6)
 
-        if not self.clusters and not self.noise_items:
-            for fv in self.dataset:
-                y_vals = [fv.membership(x) for x in x_vals]
-                self.ax_curves.plot(x_vals, y_vals, color="steelblue", alpha=0.35, linewidth=1.0)
+        # Позиция Y соответствует исходному порядку генерации; отфильтрованные строки пусты.
+        for index, fv in enumerate(self.dataset, start=1):
+            if fv.name not in active_names:
+                continue
+            color = color_by_name.get(fv.name, (0.27, 0.51, 0.71))
+            is_noise = fv.name in noise_names
+            y_vals = [fv.membership(x) for x in x_vals]
+            self.ax_curves.plot(x_vals, y_vals, color=color, linestyle=":" if is_noise else "-",
+                                alpha=0.45 if is_noise else 0.7, linewidth=1.2)
+            A, B = fv.get_alpha_cut(alpha)
+            self.ax_intervals.hlines(y=index, xmin=A, xmax=B, color=color,
+                linestyle=":" if is_noise else "-", alpha=0.85, linewidth=2.0)
 
-            for idx, fv in enumerate(self.dataset):
-                A, B = fv.get_alpha_cut(alpha)
-                self.ax_intervals.hlines(y=idx + 1, xmin=A, xmax=B, color="steelblue", alpha=0.7, linewidth=1.5)
-        else:
-            y_pos = 1
-            for idx_c, (cid, items) in enumerate(self.clusters.items()):
-                color = self.cluster_colors_rgb[idx_c]
-                for fv in items:
-                    y_vals = [fv.membership(x) for x in x_vals]
-                    self.ax_curves.plot(x_vals, y_vals, color=color, alpha=0.7, linewidth=1.3)
-
-                    A, B = fv.get_alpha_cut(alpha)
-                    self.ax_intervals.hlines(y=y_pos, xmin=A, xmax=B, color=color, alpha=0.9, linewidth=2.2)
-                    y_pos += 1
-
-            for i, fv in enumerate(self.noise_items):
-                y_vals = [fv.membership(x) for x in x_vals]
-                lbl = f"Отсеяно / шум ({len(self.noise_items)} шт.)" if i == 0 else None
-                self.ax_curves.plot(x_vals, y_vals, color="#999999", linestyle=":", alpha=0.45, linewidth=1.0,
-                                    label=lbl)
-
-                A, B = fv.get_alpha_cut(alpha)
-                self.ax_intervals.hlines(y=y_pos, xmin=A, xmax=B, color="#999999", linestyle=":", alpha=0.6,
-                                         linewidth=1.5)
-                y_pos += 1
-
+        self.ax_intervals.axvline(x=alpha2, color="darkorange", linestyle="--", linewidth=1.8,
+                                  label=f"Вертикальное сечение α₂ = {alpha2:.2f}")
         clustered_n = sum(len(v) for v in self.clusters.values())
         noise_n = len(self.noise_items)
-        status_str = (
-            f"Кластеризовано: {clustered_n}/{len(self.dataset)} шт., отсеяно: {noise_n} шт."
-            if (self.clusters or self.noise_items) else "До кластеризации"
-        )
+        active_n = len(active_names)
+        status = (f"После α₂: {active_n}/{len(self.dataset)}; кластеризовано: {clustered_n}; шум: {noise_n}"
+                  if (self.clusters or self.noise_items) else
+                  f"После α₂: {active_n}/{len(self.dataset)}; до кластеризации")
+        # Для графика отрезков используем собственный масштаб X:
+        # он определяется фактическими правыми границами alpha-сечений,
+        # а не широким диапазоном, необходимым графику функций.
+        interval_right_ends = [
+            fv.get_alpha_cut(alpha)[1]
+            for fv in self.dataset
+            if fv.name in active_names
+        ]
+        if interval_right_ends:
+            interval_max = max(interval_right_ends)
+            # Округляем вверх до удобного шага 0.5 и оставляем небольшой запас.
+            interval_x_max = max(0.5, np.ceil((interval_max * 1.08) / 0.5) * 0.5)
+        else:
+            interval_x_max = 2.0
 
         self.ax_curves.set_xlim(0, fixed_x_max)
-        self.ax_intervals.set_xlim(0, fixed_x_max)
-
-        self.ax_curves.set_title(f"Семейство из {len(self.dataset)} графиков Э(x; λ) | {status_str}")
+        self.ax_intervals.set_xlim(0, interval_x_max)
+        self.ax_intervals.set_ylim(0, len(self.dataset) + 1)
+        self.ax_curves.set_title(f"Семейство функций | {status}")
         self.ax_curves.set_xlabel("x")
         self.ax_curves.set_ylabel("Э(x; λ)")
         self.ax_curves.grid(True, linestyle=":", alpha=0.6)
         self.ax_curves.legend(loc="upper right", fontsize=8.5)
-
-        self.ax_intervals.set_title(
-            f"Отрезки [A; B] при α = {alpha:.2f} (цветные — в кластерах, серый пунктир — отсеяны)")
+        self.ax_intervals.set_title(f"Отрезки [A; B] при α₁ = {alpha:.2f}")
         self.ax_intervals.set_xlabel("Отрезок [A; B] по оси X")
-        self.ax_intervals.set_ylabel("Индекс величины")
+        self.ax_intervals.set_ylabel("Индекс величины (порядок генерации)")
+        # Не подписываем все 100–300 строк: редкие метки сохраняют
+        # читаемость и убирают сплошную чёрную полосу слева.
+        tick_count = min(10, len(self.dataset))
+        if tick_count > 0:
+            y_ticks = np.unique(np.linspace(
+                1, len(self.dataset), tick_count, dtype=int
+            ))
+            self.ax_intervals.set_yticks(y_ticks)
+        else:
+            self.ax_intervals.set_yticks([])
+        self.ax_intervals.tick_params(axis="y", labelsize=8)
         self.ax_intervals.grid(True, linestyle=":", alpha=0.6)
-
+        self.ax_intervals.legend(loc="upper right", fontsize=8.5)
         self.fig.tight_layout()
         self.canvas.draw()
 
